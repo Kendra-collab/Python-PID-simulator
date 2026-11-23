@@ -1,0 +1,159 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+DT = 0.02
+TOTAL_TIME = 32.0
+LINE_WIDTH = 0.020
+WHEEL_SEPARATION = 0.150
+BASE_SPEED = 0.16
+MAX_SPEED = 0.30
+SENSOR_OFFSETS = np.array([-0.030, -0.015, 0.0, 0.015, 0.030])
+SENSOR_WEIGHTS = np.array([-2.0, -1.0, 0.0, 1.0, 2.0])
+
+def make_track():
+    x1 = np.linspace(0.0, 1.0, 250)
+    y1 = np.zeros_like(x1)
+
+    t = np.linspace(0.0, 1.0, 500)
+    x2 = 1.0 + 1.8 * t
+    y2 = 0.15 * (1.0 - np.cos(2.0 * np.pi * t)) / 2.0
+
+    x3 = np.linspace(2.8, 3.5, 180)
+    y3 = np.zeros_like(x3)
+
+    angle = np.linspace(0.0, np.pi / 2.0, 250)
+    radius = 0.35
+    x4 = 3.5 + radius * np.sin(angle)
+    y4 = radius * (1.0 - np.cos(angle))
+
+    x5 = np.full(220, 3.5 + radius)
+    y5 = np.linspace(radius, 1.5, 220)
+
+    tx = np.concatenate([x1, x2[1:], x3[1:], x4[1:], x5[1:]])
+    ty = np.concatenate([y1, y2[1:], y3[1:], y4[1:], y5[1:]])
+    return tx, ty, np.column_stack([tx, ty])
+
+def read_virtual_sensors(x, y, theta, track_points):
+    # Positive sensor offset is to the robot's right.
+    right_direction = np.array([np.sin(theta), -np.cos(theta)])
+    sensor_positions = (
+        np.array([x, y])[None, :]
+        + SENSOR_OFFSETS[:, None] * right_direction[None, :]
+    )
+    differences = sensor_positions[:, None, :] - track_points[None, :, :]
+    min_distance_squared = np.min(np.sum(differences**2, axis=2), axis=1)
+    distance = np.sqrt(min_distance_squared)
+
+    # Smooth analogue-like reflectance response.
+    sigma = 0.018
+    return np.exp(-0.5 * (distance / sigma)**2)
+
+def calculate_error(readings):
+    total = np.sum(readings)
+    if total < 1e-8:
+        return None
+    return float(np.dot(SENSOR_WEIGHTS, readings) / total)
+
+def simulate(controller, track_points):
+    x, y, theta = 0.25, 0.025, 0.0
+    integral = 0.0
+    previous_error = None
+    last_error = 0.0
+
+    # Gains tuned for this particular simplified simulation.
+    kp, ki, kd = 0.055, 0.0008, 0.0025
+
+    history = {"x": [], "y": [], "error": [], "time": []}
+    for step in range(int(TOTAL_TIME / DT)):
+        readings = read_virtual_sensors(x, y, theta, track_points)
+        error = calculate_error(readings)
+
+        # If all sensors lose the line, hold the last known error.
+        if error is None:
+            error = last_error
+        else:
+            last_error = error
+
+        if previous_error is None:
+            previous_error = error
+
+        correction = kp * error
+        if controller == "PID":
+            integral = np.clip(integral + error * DT, -3.0, 3.0)
+            derivative = (error - previous_error) / DT
+            correction = kp * error + ki * integral + kd * derivative
+
+        previous_error = error
+
+        # Positive error means the line is to the robot's right.
+        # Increase left-wheel speed and decrease right-wheel speed to turn right.
+        left_speed = np.clip(BASE_SPEED + correction, -MAX_SPEED, MAX_SPEED)
+        right_speed = np.clip(BASE_SPEED - correction, -MAX_SPEED, MAX_SPEED)
+
+        linear_speed = (left_speed + right_speed) / 2.0
+        angular_speed = (right_speed - left_speed) / WHEEL_SEPARATION
+
+        x += linear_speed * np.cos(theta) * DT
+        y += linear_speed * np.sin(theta) * DT
+        theta += angular_speed * DT
+        theta = (theta + np.pi) % (2.0 * np.pi) - np.pi
+
+        history["x"].append(x)
+        history["y"].append(y)
+        history["error"].append(error)
+        history["time"].append(step * DT)
+
+    return {key: np.asarray(value) for key, value in history.items()}
+
+def rms_track_distance(result, track_points):
+    robot_positions = np.column_stack([result["x"], result["y"]])
+    distances = []
+    for start in range(0, len(robot_positions), 100):
+        chunk = robot_positions[start:start + 100]
+        diff = chunk[:, None, :] - track_points[None, :, :]
+        distances.extend(np.sqrt(np.min(np.sum(diff**2, axis=2), axis=1)))
+    distances = np.asarray(distances)
+    return float(np.sqrt(np.mean(distances**2)))
+
+def main():
+    tx, ty, track_points = make_track()
+    p_result = simulate("P", track_points)
+    pid_result = simulate("PID", track_points)
+
+    p_rms = rms_track_distance(p_result, track_points)
+    pid_rms = rms_track_distance(pid_result, track_points)
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(tx, ty, "k--", linewidth=2, label="Reference track")
+    plt.plot(p_result["x"], p_result["y"], label=f"P-only (RMS={p_rms:.3f} m)")
+    plt.plot(pid_result["x"], pid_result["y"], label=f"PID (RMS={pid_rms:.3f} m)")
+    plt.xlabel("X position (m)")
+    plt.ylabel("Y position (m)")
+    plt.title("Line-following robot: P-only vs PID trajectory")
+    plt.axis("equal")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("trajectory_comparison.png", dpi=180)
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(p_result["time"], p_result["error"], label="P-only")
+    plt.plot(pid_result["time"], pid_result["error"], label="PID")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Normalized sensor error (sensor units)")
+    plt.title("Virtual sensor tracking error: P-only vs PID")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("tracking_error_comparison.png", dpi=180)
+
+    print(f"P-only RMS track distance: {p_rms:.4f} m")
+    print(f"PID RMS track distance:    {pid_rms:.4f} m")
+    if pid_rms < p_rms:
+        improvement = (p_rms - pid_rms) / p_rms * 100.0
+        print(f"PID reduced RMS error by:  {improvement:.1f}%")
+    print("Saved trajectory_comparison.png and tracking_error_comparison.png")
+    plt.show()
+
+if __name__ == "__main__":
+    main()
